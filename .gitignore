@@ -1,0 +1,30 @@
+# Simulation / waveforms
+*.vcd
+*.fst
+*.wlf
+*.vpd
+*.log
+*.tmp
+
+# Build/output directories
+build/
+out/
+work/
+sim_build/
+obj_dir/
+
+# Tool-specific
+*.rpt
+*.jou
+*.pb
+*.qws
+*.qpf
+*.qsf
+db/
+incremental_db/
+output_files/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
