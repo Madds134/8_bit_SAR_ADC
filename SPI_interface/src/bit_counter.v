@@ -6,25 +6,43 @@
 module bit_counter (
     input wire sclk, // SPI clock
     input wire cs_n, // Active low chip select
-    output reg freeze // Control signal for other blocks when count 10 bits
+    output reg freeze, // Control signal for other blocks when count 10 bits
+    output reg cmd_done, // Pulse at 8 bits
+    output reg frame_done // Pulse at 16 bits
 );
 
 // Internal 4-bit counter to track bits 0 through 10
-reg [3:0] bit_count;
+reg [4:0] bit_count;
 
 // Sequential logic for bit tracking
 // cs_n is used as asynchronous reset to ensure immediate readiness upon frame initation.
 always @(negedge sclk or posedge cs_n) begin
     if (cs_n) begin // Reset
-        bit_count <= 4'b0;
+        bit_count <= 5'b0;
         freeze <= 1'b0;
-    end
-    else if (bit_count >= 10) begin // 10 bits have been shifted
-        freeze <= 1'b1;
+        cmd_done <= 1'b0;
+        frame_done <= 1'b0;
     end
     else begin
-        bit_count <= bit_count + 1'b1;
+        cmd_done <= 1'b0;
+        frame_done <= 1'b0;
         freeze <= 1'b0;
+
+        if(bit_count < 5'd16) begin
+            bit_count <= bit_count + 5'd1;
+            if(bit_count == 5'd7) begin
+                cmd_done <= 1'b1;
+            end
+            if(bit_count == 5'd15) begin // Latch bit counter if > 15
+                frame_done <= 1'b1;
+            end
+        end
+      	if (bit_count >= 5'd15) begin
+          freeze <= 1'b1;
+      	end
+      	else begin
+          freeze <= 1'b0;
+        end
     end
 end
 endmodule

@@ -3,11 +3,15 @@ module tb_bit_counter;
     logic sclk;
     logic cs_n;
     logic freeze;
+    logic cmd_done;
+    logic frame_done;
 
     bit_counter dut (
         .sclk(sclk),
         .cs_n(cs_n),
-        .freeze(freeze)
+        .freeze(freeze),
+        .cmd_done(cmd_done),
+        .frame_done(frame_done)
     );
 
     // Clock generation: 10 MHz if timescale is 1ns (period = 100 ns)
