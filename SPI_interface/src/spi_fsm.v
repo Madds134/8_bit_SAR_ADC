@@ -12,7 +12,7 @@ module spi_fsm (
     localparam IDLE=0, CMD=1, READ=2, WRITE=3;
     reg [2:0] next_state, state;
     reg read_write;
-    wire freeze, cmd_done, frame_done;
+    wire cmd_done, frame_done;
     wire [7:0] rx_data;
 
     // Instantiate the rx_shift_register
@@ -20,7 +20,6 @@ module spi_fsm (
         .sclk(sclk),
         .cs_n(cs_n),
         .mosi(mosi),
-        .freeze(freeze),
         .cmd_done(cmd_done),
         .frame_done(frame_done),
       	.rx_data(rx_data),
@@ -31,7 +30,6 @@ module spi_fsm (
     bit_counter count(
         .sclk(sclk),
         .cs_n(cs_n),
-        .freeze(freeze),
         .cmd_done(cmd_done),
         .frame_done(frame_done)
     );
@@ -42,7 +40,7 @@ module spi_fsm (
         tx_load_en = 0;
         case(state) 
             IDLE: begin
-                next_state = (cs_n || freeze) ? IDLE : CMD;
+                next_state = (cs_n || frame_done) ? IDLE : CMD;
             end
             CMD: begin
                 if (cmd_done) begin

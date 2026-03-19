@@ -6,7 +6,6 @@
 module bit_counter (
     input wire sclk, // SPI clock
     input wire cs_n, // Active low chip select
-    output reg freeze, // Control signal for other blocks when count 10 bits
     output reg cmd_done, // Pulse at 8 bits
     output reg frame_done // Pulse at 16 bits
 );
@@ -19,14 +18,11 @@ reg [4:0] bit_count;
 always @(posedge sclk or posedge cs_n) begin
     if (cs_n) begin // Reset
         bit_count <= 5'b0;
-        freeze <= 1'b0;
         cmd_done <= 1'b0;
         frame_done <= 1'b0;
     end
     else begin
         cmd_done <= 1'b0;
-        frame_done <= 1'b0;
-        freeze <= 1'b0;
 
         if(bit_count < 5'd16) begin
             bit_count <= bit_count + 5'd1;
@@ -36,12 +32,6 @@ always @(posedge sclk or posedge cs_n) begin
             if(bit_count == 5'd15) begin // Latch bit counter if > 15
                 frame_done <= 1'b1;
             end
-        end
-      	if (bit_count >= 5'd15) begin
-          freeze <= 1'b1;
-      	end
-      	else begin
-          freeze <= 1'b0;
         end
     end
 end
