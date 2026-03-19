@@ -42,7 +42,7 @@ module spi_fsm (
         tx_load_en = 0;
         case(state) 
             IDLE: begin
-                next_state = (cs_n) ? IDLE : CMD;
+                next_state = (cs_n || freeze) ? IDLE : CMD;
             end
             CMD: begin
                 if (cmd_done) begin
