@@ -16,7 +16,7 @@ reg [4:0] bit_count;
 
 // Sequential logic for bit tracking
 // cs_n is used as asynchronous reset to ensure immediate readiness upon frame initation.
-always @(negedge sclk or posedge cs_n) begin
+always @(posedge sclk or posedge cs_n) begin
     if (cs_n) begin // Reset
         bit_count <= 5'b0;
         freeze <= 1'b0;
