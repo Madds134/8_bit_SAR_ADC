@@ -1,6 +1,6 @@
 module tx_shift_register (
     input wire sclk,
-    input wire frame_done,
+    input wire [4:0] bit_count,
     input wire cs_n,
     input wire [7:0] data,
     input wire tx_load_en,
@@ -20,10 +20,11 @@ always @(negedge sclk or posedge cs_n) begin
             shift_register <= data;
             loaded <= 1'b1;
         end
-        if(!frame_done) begin
+      	else if(!(bit_count == 4'd16)) begin
             shift_register <= {shift_register[6:0], 1'b0};
         end
     end
 end
 assign miso = shift_register[7];
 endmodule
+

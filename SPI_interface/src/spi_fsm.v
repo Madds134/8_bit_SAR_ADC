@@ -2,7 +2,8 @@ module spi_fsm (
     input wire sclk,
     input wire cs_n,
     input wire mosi,
-  	input wire cmd_valid,
+  	input wire [7:0] rx_data,
+  input wire [4:0] bit_count,
     
     output reg [6:0] addr,
     output reg reg_write_en,
@@ -12,27 +13,7 @@ module spi_fsm (
     localparam IDLE=0, CMD=1, READ=2, WRITE=3;
     reg [2:0] next_state, state;
     reg read_write;
-    wire cmd_done, frame_done;
-    wire [7:0] rx_data;
 
-    // Instantiate the rx_shift_register
-    rx_shift_register r_reg(
-        .sclk(sclk),
-        .cs_n(cs_n),
-        .mosi(mosi),
-        .cmd_done(cmd_done),
-        .frame_done(frame_done),
-      	.rx_data(rx_data),
-      	.cmd_valid(cmd_valid)
-    );
-
-    // Instantiate the bit_counter
-    bit_counter count(
-        .sclk(sclk),
-        .cs_n(cs_n),
-        .cmd_done(cmd_done),
-        .frame_done(frame_done)
-    );
 
     always @(*) begin
         next_state = state;
@@ -40,21 +21,21 @@ module spi_fsm (
         tx_load_en = 0;
         case(state) 
             IDLE: begin
-                next_state = (cs_n || frame_done) ? IDLE : CMD;
+                next_state = (cs_n || bit_count == 4'd15) ? IDLE : CMD;
             end
             CMD: begin
-                if (cmd_done) begin
-                    if (read_write) begin
+                if (bit_count == 4'd7) begin
+                    tx_load_en = 1'b1;
+                    if (rx_data[7]) begin
                         next_state = READ;
                     end
-                    else if (!read_write) begin
+                    else if (!rx_data[7]) begin
                         next_state = WRITE;    
                     end
                 end
             end
             READ: begin
-                tx_load_en = 1;
-                if(frame_done) begin
+              if(bit_count == 4'd16) begin
                     next_state = IDLE;
                 end
                 else begin
@@ -62,9 +43,8 @@ module spi_fsm (
                 end
             end
             WRITE: begin
-                tx_load_en = 1;
                 reg_write_en = 1;
-                if(frame_done) begin
+              if(bit_count == 4'd16) begin
                     next_state = IDLE;
                 end
                 else begin
@@ -84,10 +64,92 @@ module spi_fsm (
         end
         else begin
             state <= next_state;
-          if(cmd_valid) begin
+          if(bit_count == 4'd7) begin
                 read_write <= rx_data[7];
                 addr <= rx_data[6:0];
             end
         end
     end
 endmodule
+// Module: bit_counter
+// Project: 8-bit SAR ADC for TinyTapeout
+// Function: Tracks SPI clock cycles to enforce 10 bit frame boundaries.
+//           Provides a freeze outut signal to prevent data wrap around/over clocking.
+
+module bit_counter (
+    input wire sclk, // SPI clock
+    input wire cs_n, // Active low chip select
+    output reg [4:0] bit_count
+);
+
+
+// Sequential logic for bit tracking
+// cs_n is used as asynchronous reset to ensure immediate readiness upon frame initation.
+always @(posedge sclk or posedge cs_n) begin
+    if (cs_n) begin // Reset
+        bit_count <= 5'b0;
+    end
+    else begin
+        if(bit_count < 5'd16) begin
+            bit_count <= bit_count + 5'd1;
+        end
+    end
+end
+endmodule
+    
+module rx_shift_register (
+    input wire sclk,
+    input wire cs_n,
+    input wire mosi,
+    input reg [4:0] bit_count,
+    output reg [7:0] rx_data,
+    output wire cmd_valid
+);
+    reg [7:0] shift_register;
+
+  always @(posedge sclk or posedge cs_n) begin
+        if(cs_n) begin
+            shift_register <= 8'd0;
+            rx_data <= 8'd0;
+        end
+        else begin
+            if(!bit_count == 4'd15) begin
+                shift_register <= {shift_register[6:0], mosi};
+            end
+          if(bit_count == 4'd7 || bit_count == 4'd15) begin
+                rx_data <= {shift_register[6:0], mosi};
+            end
+        end
+    end
+  assign cmd_valid = (bit_count == 4'd8);
+endmodule
+module tx_shift_register (
+    input wire sclk,
+    input wire [4:0] bit_count,
+    input wire cs_n,
+    input wire [7:0] data,
+    input wire tx_load_en,
+    output wire miso
+);
+
+reg [7:0] shift_register;
+reg loaded;
+
+always @(negedge sclk or posedge cs_n) begin
+    if(cs_n) begin
+        shift_register <= 8'b0;
+      	loaded <= 1'b0;
+    end
+    else begin
+        if(tx_load_en && !loaded) begin
+            shift_register <= data;
+            loaded <= 1'b1;
+        end
+      	else if(!(bit_count == 4'd16)) begin
+            shift_register <= {shift_register[6:0], 1'b0};
+        end
+    end
+end
+assign miso = shift_register[7];
+endmodule
+
