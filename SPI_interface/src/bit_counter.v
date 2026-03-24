@@ -1,3 +1,8 @@
+// Module: bit_counter
+// Project: 8-bit SAR ADC for TinyTapeout
+// Function: Tracks SPI clock cycles to enforce 10 bit frame boundaries.
+//           Provides a freeze outut signal to prevent data wrap around/over clocking.
+
 module bit_counter (
     input wire sclk, // SPI clock
     input wire cs_n, // Active low chip select

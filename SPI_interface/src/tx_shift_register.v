@@ -27,4 +27,3 @@ always @(negedge sclk or posedge cs_n) begin
 end
 assign miso = shift_register[7];
 endmodule
-

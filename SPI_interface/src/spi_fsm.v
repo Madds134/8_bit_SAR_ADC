@@ -71,58 +71,9 @@ module spi_fsm (
         end
     end
 endmodule
-// Module: bit_counter
-// Project: 8-bit SAR ADC for TinyTapeout
-// Function: Tracks SPI clock cycles to enforce 10 bit frame boundaries.
-//           Provides a freeze outut signal to prevent data wrap around/over clocking.
 
-module bit_counter (
-    input wire sclk, // SPI clock
-    input wire cs_n, // Active low chip select
-    output reg [4:0] bit_count
-);
-
-
-// Sequential logic for bit tracking
-// cs_n is used as asynchronous reset to ensure immediate readiness upon frame initation.
-always @(posedge sclk or posedge cs_n) begin
-    if (cs_n) begin // Reset
-        bit_count <= 5'b0;
-    end
-    else begin
-        if(bit_count < 5'd16) begin
-            bit_count <= bit_count + 5'd1;
-        end
-    end
-end
-endmodule
     
-module rx_shift_register (
-    input wire sclk,
-    input wire cs_n,
-    input wire mosi,
-    input reg [4:0] bit_count,
-    output reg [7:0] rx_data,
-    output wire cmd_valid
-);
-    reg [7:0] shift_register;
 
-  always @(posedge sclk or posedge cs_n) begin
-        if(cs_n) begin
-            shift_register <= 8'd0;
-            rx_data <= 8'd0;
-        end
-        else begin
-            if(!bit_count == 4'd15) begin
-                shift_register <= {shift_register[6:0], mosi};
-            end
-          if(bit_count == 4'd7 || bit_count == 4'd15) begin
-                rx_data <= {shift_register[6:0], mosi};
-            end
-        end
-    end
-  assign cmd_valid = (bit_count == 4'd8);
-endmodule
 module tx_shift_register (
     input wire sclk,
     input wire [4:0] bit_count,
