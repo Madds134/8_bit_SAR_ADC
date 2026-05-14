@@ -90,7 +90,7 @@ module spi_coverage (
 
     spi_cg cg = new();
 
-    inital begin
+    initial begin
         prev_valid = 0;
         prev_rw = 0;
         prev_aborted = 0;
@@ -133,13 +133,13 @@ module spi_coverage (
         );
 
         prev_valid <= 1'b1;
-        prev_ew <= rw;
+        prev_rw <= rw;
         prev_aborted <= aborted;
         prev_addr <= addr;
     end
 
     final begin
-        $display("\n[COV] Functional Coverage = 0.2f%%", cg.get_inst_coverage());
+        $display("\n[COV] Functional Coverage = %0.2f%%", cg.get_inst_coverage());
     end
 endmodule  
 

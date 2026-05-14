@@ -1,3 +1,4 @@
+// DEPRECATED
 `timescale 1ns/1ps
 module tb_bit_counter;
     logic sclk;
@@ -31,8 +32,8 @@ module tb_bit_counter;
         cs_n = 1'b0;
         $display("cs_n dropped. Sending 12 clock pulses to test freeze logic");
 
-        // Send 12 clock pulses (counting edges depends on your DUT design)
-        repeat (12) begin
+        // Send 20 clock pulses (counting edges depends on your DUT design)
+        repeat (20) begin
             @(negedge sclk);
         end
 

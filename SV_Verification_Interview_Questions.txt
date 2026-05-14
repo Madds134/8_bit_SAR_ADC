@@ -1,0 +1,1118 @@
+================================================================================
+SYSTEMVERILOG VERIFICATION — COMPLETE INTERVIEW QUESTION BANK
+Junior Co-op --> Senior Verification Engineer
+SPI Interface Project | 8-bit SAR ADC
+================================================================================
+
+
+================================================================================
+LEVEL 1 — JUNIOR / CO-OP ENTRY
+"Tell me what you know" — screen for basic SV and verification awareness
+================================================================================
+
+--------------------------------------------------------------------------------
+SYSTEMVERILOG FUNDAMENTALS
+--------------------------------------------------------------------------------
+
+Q: What is the difference between logic, wire, and reg in SystemVerilog?
+A: wire is a net — driven by continuous assignment or module output, no storage.
+   reg is a variable — holds state between procedural assignments (misleadingly
+   named, doesn't imply a flip-flop). logic replaces both in SV — it can be
+   driven from a single driver (procedural or continuous) and synthesizes to
+   the correct hardware. Use logic for everything in modern SV except where
+   multiple drivers are intentional (wire for that). The only hardware
+   distinction comes from where you assign it, not the type keyword.
+
+---
+
+Q: What is the difference between blocking (=) and non-blocking (<=) assignment?
+A: Blocking (=) executes immediately in sequence — the left-hand side is updated
+   before the next statement runs. Non-blocking (<=) schedules the update to
+   happen at the end of the time step — all right-hand sides are evaluated
+   first, then all updates happen simultaneously. Use <= in clocked always_ff
+   blocks to model flip-flop behavior correctly. Use = in combinational
+   always_comb and in testbench tasks/functions. Mixing them in the same
+   always_ff block is a common bug — the blocking assignment can corrupt
+   simulation results.
+
+---
+
+Q: What is the difference between $display and $strobe?
+A: $display prints at the moment it is called, which may be mid-time-step before
+   non-blocking assignments have settled. $strobe prints at the end of the
+   current time step, after all non-blocking updates have resolved. In a clocked
+   testbench, $strobe gives you the final settled value of signals; $display
+   may show stale or intermediate values.
+
+---
+
+Q: What does posedge vs negedge mean in an always block sensitivity list?
+A: posedge triggers on the 0->1 transition of a signal. negedge triggers on the
+   1->0 transition. In the SPI testbench, always @(posedge sclk) in the monitor
+   captures MOSI at the rising clock edge (SPI Mode 0 sampling). always
+   @(negedge cs_n) detects frame start — CS going from high (idle) to low
+   (active).
+
+---
+
+Q: What is an initial block vs an always block?
+A: initial executes once at time 0 and terminates. Used in testbenches for
+   stimulus sequencing and one-time setup. always runs continuously,
+   re-triggering on its sensitivity list. In the testbench, the
+   initial begin ... $finish end block runs the entire test sequence once.
+   The always #5 sclk = ~sclk generates the clock forever.
+
+---
+
+Q: What is a task vs a function in SystemVerilog?
+A: Functions execute in zero simulation time, cannot contain time-consuming
+   statements (@, #, wait), and must return a value. Tasks can consume
+   simulation time, contain delays and event waits, and don't need to return
+   values. send_byte, spi_write, spi_read are all tasks because they use
+   @(posedge sclk) to wait for clock edges. The automatic keyword makes local
+   variables unique per call — essential for tasks called concurrently.
+
+---
+
+Q: What does automatic do on a task or function? When do you need it?
+A: Without automatic, task local variables are static — shared across all
+   concurrent invocations of that task. If you call the same task from two
+   parallel threads, they stomp on each other's variables. automatic makes
+   each call get its own stack frame. In a verification environment where you
+   might fork multiple sequences, all tasks should be automatic.
+   task automatic send_byte(...) is the correct pattern.
+
+---
+
+Q: What is $finish vs $stop?
+A: $finish terminates the simulation and exits the simulator process. $stop
+   pauses simulation and drops into the simulator's interactive mode. In
+   testbenches, $finish at the end of the test is standard. $stop is useful
+   during debug to inspect state interactively without losing the simulation
+   session.
+
+---
+
+Q: What is a localparam vs a parameter?
+A: Both define constants. parameter can be overridden when instantiating the
+   module (like a template argument). localparam is fixed — it cannot be
+   overridden externally. Use localparam for internal constants that should
+   never be changed by the caller (like ADC_CFG_ADDR = 7'h00 in the
+   scoreboard). Use parameter for configuration values like data width that
+   instantiators might want to customize.
+
+---
+
+Q: What is an interface in SystemVerilog and why is it useful in verification?
+A: An interface bundles related signals into a named group, similar to a struct
+   but for ports. Instead of connecting 15 individual signals between a DUT
+   and testbench, you connect one interface handle. Interfaces can also contain
+   tasks, functions, and clocking blocks for timing abstraction. In
+   verification, they enable virtual interfaces — class-based testbench objects
+   (drivers, monitors) can hold a handle to an interface and drive/sample DUT
+   signals without knowing the physical port connections. This makes the
+   testbench reusable across different DUT configurations.
+
+--------------------------------------------------------------------------------
+PROTOCOL BASICS
+--------------------------------------------------------------------------------
+
+Q: Walk me through a complete SPI write transaction as implemented in your
+   testbench.
+A: Looking at spi_write() in test3.sv:
+   (1) start_frame() waits for posedge sclk then asserts CS low.
+   (2) send_byte({1'b0, addr}) drives the command byte — MSB is 0 (write),
+       lower 7 bits are the address.
+   (3) send_byte(data) drives the 8-bit data. Each byte drives MOSI on negedge
+       sclk (setup time before the rising edge where DUT samples).
+   (4) stop_frame() deasserts CS on negedge sclk and clears MOSI.
+   Total = 16 SCLK cycles with CS low.
+
+---
+
+Q: Why does send_byte drive MOSI on negedge sclk but sample MISO on posedge?
+A: Setup/hold timing. The DUT (and the monitor) samples MOSI on posedge sclk.
+   To meet setup time, MOSI must be stable before the rising edge — so you
+   change it on the falling edge, giving half a clock period of setup time.
+   MISO is driven by the DUT and is valid at the rising edge for the master to
+   sample, so the testbench reads it on posedge sclk in
+   send_byte_capture_miso. This is standard SPI Mode 0 behavior.
+
+
+================================================================================
+LEVEL 2 — MID-LEVEL (1-2 YEARS)
+Know the architecture, can write components from scratch, understands methodology
+================================================================================
+
+--------------------------------------------------------------------------------
+ADVANCED CRV
+--------------------------------------------------------------------------------
+
+Q: What is constraint solving order and why does it matter?
+A: The SV constraint solver treats all constraints as a simultaneous system of
+   equations — there is no guaranteed evaluation order. This means you cannot
+   write sequential constraints like "first solve A, then use A to constrain B."
+   Instead, use implication (->) or if blocks to express dependencies.
+   Example: if frame_kind determines valid ranges for abort_after_bits, write:
+       if (frame_kind == ABORT_MID_CMD) { abort_after_bits inside {[1:7]}; }
+   The solver handles the dependency automatically.
+
+---
+
+Q: What is constraint inheritance and how does it work when you extend a class?
+A: A subclass inherits all constraints from its parent class and adds its own.
+   All constraints from parent and child are active simultaneously — the solver
+   must satisfy all of them at once. If a child constraint conflicts with a
+   parent constraint, randomize() returns 0 (failure). You can override a
+   parent constraint in the child by declaring a constraint with the same name
+   — the child's version replaces the parent's. This is how spi_stress_txn
+   extends spi_txn works — it adds c_stress on top of whatever spi_txn defines.
+
+---
+
+Q: What is a solve...before constraint and when do you use it?
+A: solve A before B is a constraint ordering hint — it tells the solver to
+   randomize A first, then use A's value when solving B. This doesn't add a
+   logical constraint but affects the distribution. Without it:
+       if (mode == WRITE) { addr inside {WRITABLE_ADDRS}; }
+   can produce very skewed distributions because the solver explores the full
+   joint space. With solve mode before addr, you get the expected 50/50 mode
+   split with proper addr distribution within each mode. Use it when you
+   observe unexpected distributions in your random output.
+
+---
+
+Q: How do you generate a unique set of N random values with no repeats?
+
+   // Option 1: randc (cycles through all values before repeating)
+   class unique_addr_gen;
+       randc bit [6:0] addr;
+   endclass
+
+   // Option 2: manual queue approach
+   bit [6:0] used[$];
+   function bit [6:0] get_unique_addr();
+       bit [6:0] candidate;
+       do begin
+           void'(std::randomize(candidate));
+       end while (used.find_index with (item == candidate).size() > 0);
+       used.push_back(candidate);
+       return candidate;
+   endfunction
+
+   randc is the clean solution for small types. For constrained uniqueness
+   (unique within a specific set), the manual queue approach gives full control.
+
+---
+
+Q: What is a pre_randomize and post_randomize callback? Give a use case.
+A: pre_randomize() is called automatically before randomize() solves constraints.
+   post_randomize() is called after constraints are solved and fields are filled.
+   Use pre_randomize to set up state that constraints depend on.
+   Use post_randomize to compute derived fields from randomized values:
+
+   class spi_txn;
+       rand bit [7:0] data;
+       bit [7:0] data_complement;   // derived, not rand
+
+       function void post_randomize();
+           data_complement = ~data;  // computed after data is solved
+       endfunction
+   endclass
+
+---
+
+Q: What is a randsequence and when would you use it over a standard constraint?
+A: randsequence generates random sequences of operations using a grammar-like
+   syntax — each production can randomly select between alternatives with
+   weights. Use it when you want to generate random sequences of protocol
+   operations rather than random fields within a single transaction:
+
+   randsequence(main)
+       main      : write_seq | read_seq | mixed_seq;
+       write_seq : write write write;
+       read_seq  : read read;
+       mixed_seq : write read write;
+       write : { spi_write(addr, data); };
+       read  : { spi_read(addr, rdata); };
+   endsequence
+
+   This models scenarios at the sequence level rather than the transaction level.
+
+--------------------------------------------------------------------------------
+ADVANCED SCOREBOARD
+--------------------------------------------------------------------------------
+
+Q: How do you handle a DUT that has pipelining — requests go in but responses
+   come out N cycles later?
+A: Use a FIFO queue to hold expected results in order:
+
+   logic [7:0] expected_q[$];
+
+   // When stimulus is sent:
+   task send_read(input logic [6:0] addr);
+       expected_q.push_back(model_rf[addr]);
+       drive_read_transaction(addr);
+   endtask
+
+   // When response arrives:
+   always @(posedge response_valid) begin
+       if (expected_q.size() == 0)
+           $error("Response with no pending request");
+       else begin
+           if (actual_data == expected_q.pop_front())
+               pass_count++;
+           else
+               $error("Mismatch");
+       end
+   end
+
+   For out-of-order responses, use an associative array keyed by transaction ID.
+
+---
+
+Q: What is a shadow model vs a behavioral model in a scoreboard?
+A: A shadow model directly mirrors the DUT's internal registers or state — it
+   does the same operations in the same order and tracks the same variables.
+   Accurate but tightly coupled to the implementation.
+   A behavioral model describes intended behavior at a higher abstraction level
+   — it might compute an expected CRC output without knowing pipeline stages.
+   Shadow models catch implementation bugs; behavioral models catch
+   spec-interpretation bugs. model_rf[addr[2:0]] = data_byte in the SPI
+   scoreboard is a shadow model — it mirrors the DUT register exactly.
+
+---
+
+Q: Your scoreboard shows 0 failures but you suspect a bug. What could cause it
+   to silently miss errors?
+A: Several failure modes:
+   1. txn_valid never pulses — scoreboard never receives transactions to check
+   2. Reference model wrong initial state — both agree on wrong values
+   3. aborted always true — every transaction is skipped as aborted
+   4. Only writes exercised, no reads — model updates but you never compare
+   5. Address decoding bug — DUT writes to addr X but model writes to addr Y,
+      and you never read addr X back
+   6. supported_addr function has a bug — unsupported addresses silently
+      increment unsupported_count without checking for unexpected DUT behavior
+
+--------------------------------------------------------------------------------
+ADVANCED COVERAGE
+--------------------------------------------------------------------------------
+
+Q: What is coverage-driven verification (CDV) and how does it differ from purely
+   random simulation?
+A: CDV is a closed loop: define coverage goals -> run random simulation ->
+   measure coverage -> analyze holes -> add directed tests or biased constraints
+   to close holes -> repeat until coverage goals met. Purely random simulation
+   has no feedback loop. CDV treats coverage as a first-class metric that
+   drives the verification process. Noticing cp_wr_then_rd_same: yes was at 0%
+   and adding a directed test to close it is exactly CDV methodology.
+
+---
+
+Q: What is a covergroup option and type_option? Give examples.
+A: option applies to a specific covergroup instance.
+   type_option applies to all instances of that covergroup type.
+
+   covergroup spi_cg;
+       option.per_instance = 1;       // track each instance separately
+       option.goal = 90;              // target 90% not 100%
+       option.comment = "SPI Functional Coverage";
+       option.weight = 2;             // weight this group twice as heavily
+       type_option.merge_instances = 1; // merge across instances for reporting
+   endgroup
+
+---
+
+Q: What is transition coverage and when is it more useful than standard bins?
+A: Transition coverage tracks sequences of values, not just individual values.
+   Transition bins record "was this value seen immediately after that value?":
+
+   cp_rw: coverpoint rw_s {
+       bins wr_then_rd      = (0 => 1);        // write followed by read
+       bins rd_then_wr      = (1 => 0);        // read followed by write
+       bins back_to_back_wr = (0 => 0 => 0);  // 3 consecutive writes
+   }
+
+   This is more powerful than a manual cur_wr_then_rd_same_addr flag and
+   directly replaces the logic written in the coverage module. Use transition
+   coverage for any protocol where sequence of operations matters.
+
+---
+
+Q: How do you exclude a specific cross bin that is architecturally impossible?
+
+   rw_x_addr: cross cp_rw, cp_addr {
+       // ADC_RESULT_ADDR is read-only — writing to it is illegal
+       ignore_bins illegal_write_to_result =
+           binsof(cp_rw.write) && binsof(cp_addr.adc_result);
+   }
+
+   Without this, the cross requires a write to a read-only register —
+   impossible to achieve without injecting invalid stimulus. Excluding it
+   prevents a false coverage hole that can never be closed.
+
+--------------------------------------------------------------------------------
+SYSTEMVERILOG ASSERTIONS (SVA)
+--------------------------------------------------------------------------------
+
+Q: What is the difference between an immediate assertion and a concurrent one?
+A: Immediate assertion (assert (condition)) is evaluated at the point it appears
+   in procedural code — like an if-statement with an error message. It fires
+   once when execution reaches it.
+   Concurrent assertion (assert property (@(posedge clk) condition)) is
+   evaluated continuously against a clock — the simulator checks it on every
+   specified clock edge throughout simulation. Concurrent assertions are the
+   core of formal verification and protocol checking.
+
+---
+
+Q: Write an SVA assertion that verifies CS must stay low for at least 16 SCLK
+   cycles once asserted.
+
+   property p_cs_min_width;
+       @(posedge sclk)
+       $fell(cs_n) |-> ##[1:15] !cs_n;
+   endproperty
+
+   assert property (p_cs_min_width)
+       else $error("CS deasserted too early");
+
+---
+
+Q: What is the difference between |-> and |=> in SVA?
+A: |-> is overlapping implication — if the antecedent matches, the consequent
+   must start in the SAME cycle.
+   |=> is non-overlapping implication — if the antecedent matches, the
+   consequent must start in the NEXT cycle.
+
+   // Same cycle: if cmd_valid this cycle, data must be valid THIS cycle
+   cmd_valid |-> data_valid;
+
+   // Next cycle: if cmd_valid this cycle, data must be valid NEXT cycle
+   cmd_valid |=> data_valid;
+
+---
+
+Q: What does $rose, $fell, and $stable do in SVA?
+A: Sampled value functions:
+   $rose(sig)   — true when sig is 1 this cycle and was 0 last cycle (0->1)
+   $fell(sig)   — true when sig is 0 this cycle and was 1 last cycle (1->0)
+   $stable(sig) — true when sig has the same value this cycle as last cycle
+
+   In SPI context:
+   $fell(cs_n)  — detects frame start
+   $rose(cs_n)  — detects frame end
+   $stable(mosi)— verifies MOSI doesn't glitch mid-bit
+
+---
+
+Q: Write an assertion that checks MOSI is stable during SCLK high.
+
+   property p_mosi_stable;
+       @(posedge sclk) disable iff (cs_n)
+       1 |-> $stable(mosi);
+   endproperty
+
+   assert property (p_mosi_stable)
+       else $error("MOSI glitch detected during SCLK high period");
+
+---
+
+Q: What is disable iff in an SVA property?
+A: disable iff (condition) suspends the property when the condition is true —
+   vacuously passes during reset or inactive periods. Without it, assertions
+   fire spuriously during reset when signals are undefined. In SPI assertions,
+   disable iff (cs_n) means the assertion only runs when CS is low (frame in
+   progress) — no false failures between frames.
+
+---
+
+Q: What is a sequence vs a property in SVA?
+A: A sequence describes a temporal pattern of signal behavior across clock
+   cycles. A property uses sequences to build a complete assertion — specifies
+   what must happen, can include implication, used with assert/assume/cover.
+   Sequences are reusable building blocks:
+
+   // Reusable sequence
+   sequence s_spi_frame;
+       !cs_n ##[16:16] $rose(cs_n);
+   endsequence
+
+   // Property using the sequence
+   property p_frame_complete;
+       @(posedge sclk) $fell(cs_n) |-> s_spi_frame;
+   endproperty
+
+---
+
+Q: What is the difference between assert, assume, and cover property?
+A: assert property — checks that the property always holds; error if violated.
+   assume property — in formal, constrains the input space; in simulation acts
+                     like assert but in formal restricts exploration.
+   cover property  — checks that the property is reachable (CAN become true);
+                     verifies certain scenarios ARE exercised.
+
+   // Assert: this must always be true
+   assert property (@(posedge sclk) valid |-> !error);
+
+   // Assume: formal tool treats this as a valid input constraint
+   assume property (@(posedge sclk) !cs_n |-> !rst);
+
+   // Cover: verify we exercise write-then-read sequences
+   cover property (@(posedge sclk) reg_write_en ##[1:5] (!reg_write_en && rw));
+
+
+================================================================================
+LEVEL 3 — MID-SENIOR (3-5 YEARS)
+Architecture decisions, methodology ownership, cross-block integration
+================================================================================
+
+--------------------------------------------------------------------------------
+UVM ARCHITECTURE
+--------------------------------------------------------------------------------
+
+Q: Explain the UVM phase system and why it exists.
+A: UVM defines simulation phases in order:
+   build_phase -> connect_phase -> run_phase -> extract_phase ->
+   check_phase -> report_phase
+
+   The phase system ensures components are built and connected before simulation
+   runs, and results are checked before reports are generated. Without phasing,
+   a scoreboard might try to connect to a monitor that hasn't been instantiated
+   yet. run_phase is time-consuming (simulation time); all other phases execute
+   in zero time. The factory + phasing combo enables UVM environments to be
+   reconfigured for different tests without changing component code.
+
+---
+
+Q: What is the UVM factory and why is it powerful?
+A: The UVM factory is a registry that maps type names to constructor functions.
+   Instead of: my_driver drv = new()
+   You write:  my_driver drv = my_driver::type_id::create("drv", this)
+
+   This indirection means you can override the type at runtime — if a test needs
+   a faulty driver, it registers faulty_driver as an override for my_driver, and
+   all components that create my_driver automatically get faulty_driver instead.
+   No component code changes. This enables test-specific customization without
+   modifying the environment structure.
+
+---
+
+Q: What is a UVM TLM port and how does it replace direct signal connections?
+A: TLM (Transaction Level Modeling) ports are typed communication channels
+   between components. Instead of wiring a monitor's output signals directly to
+   a scoreboard's inputs (as in the current SPI architecture), a monitor puts a
+   transaction object into a uvm_analysis_port, and a scoreboard connects a
+   uvm_analysis_imp to receive it. Multiple subscribers can all connect to one
+   analysis port — the monitor broadcasts to all simultaneously:
+
+   Monitor --[analysis_port]--> [analysis_imp]-- Scoreboard
+                            \-> [analysis_imp]-- Coverage
+                            \-> [analysis_imp]-- Logger
+
+   This decouples components — the monitor doesn't need to know who receives
+   its transactions.
+
+---
+
+Q: What is a UVM sequence and how does it communicate with a driver?
+A: A sequence generates transaction objects and sends them to a driver via a
+   sequencer. The driver requests transactions using
+   seq_item_port.get_next_item(txn), processes them (drives the bus), then
+   calls seq_item_port.item_done(). The sequencer arbitrates between multiple
+   sequences running concurrently. This separates stimulus generation (sequence)
+   from stimulus application (driver):
+
+   Sequence -> (puts txn) -> Sequencer -> (get_next_item) -> Driver -> DUT
+
+---
+
+Q: What is uvm_config_db and what problem does it solve?
+A: uvm_config_db is a global key-value store for passing configuration between
+   UVM components without requiring hierarchical port connections. The most
+   important use: passing virtual interface handles from the top-level testbench
+   (where signals are physical) into class-based components:
+
+   // In top-level module:
+   uvm_config_db#(virtual spi_if)::set(null,
+       "uvm_test_top.env.agent.driver", "vif", spi_vif);
+
+   // In driver class:
+   virtual spi_if vif;
+   if (!uvm_config_db#(virtual spi_if)::get(this, "", "vif", vif))
+       `uvm_fatal("NO_VIF", "Virtual interface not found")
+
+---
+
+Q: What is a UVM agent and what does it contain?
+A: An agent bundles the three active-side verification components for one
+   interface: driver, sequencer, and monitor.
+   ACTIVE mode: all three instantiated — agent both drives and observes.
+   PASSIVE mode: only monitor instantiated — used when another device is
+   driving the bus and you only want to observe.
+   In a multi-agent environment (SPI master agent + register file agent), each
+   agent is independent and the environment (uvm_env) connects them through
+   a scoreboard.
+
+--------------------------------------------------------------------------------
+CLOCK DOMAIN CROSSING (CDC)
+--------------------------------------------------------------------------------
+
+Q: What is a CDC hazard and why is it dangerous?
+A: A CDC hazard occurs when a signal generated in one clock domain is sampled in
+   another with an unrelated (asynchronous) clock. If the signal transitions
+   near the setup or hold window of the receiving clock, the receiving flop may
+   sample a metastable value — neither a clean 0 nor 1. Metastability can
+   propagate corrupted data into the design. Simulators use ideal logic, not
+   electrical metastability models, so CDC bugs often pass simulation and only
+   appear in silicon. CDC must be addressed with synchronizer circuits.
+
+---
+
+Q: What is a two-flop synchronizer and when is it insufficient?
+A: A two-flop synchronizer passes a signal through two consecutive flip-flops in
+   the destination clock domain. The first flop may go metastable, but given
+   one destination clock period, the probability drops to near zero, so the
+   second flop samples a clean value.
+   Works for: single-bit control signals (enables, flags).
+   Insufficient for: multi-bit data buses — if you synchronize each bit
+   independently, they may sample from different source cycles, producing a
+   garbled value. Multi-bit data crossing requires a FIFO with gray-coded
+   read/write pointers, or a handshake protocol.
+
+---
+
+Q: How do you verify CDC in simulation? What are the limitations?
+A: Structural CDC verification: static tools (Synopsys SpyGlass CDC, Cadence
+   JasperGold CDC) analyze the netlist for crossing paths without synchronizers.
+   In simulation: use $metastable() injection if the simulator supports it, or
+   verify handshake protocol logic using assertions.
+   Fundamental limitation: simulators use ideal 0/1 logic — metastability
+   doesn't exist in simulation. You must verify CDC structurally and verify the
+   handshake protocol behaviorally, not through timing simulation alone.
+
+--------------------------------------------------------------------------------
+FORMAL VERIFICATION
+--------------------------------------------------------------------------------
+
+Q: What is formal verification and how does it differ from simulation?
+A: Formal verification uses mathematical proof to check whether a property holds
+   for ALL possible input sequences — not just ones a testbench generates. A
+   formal tool explores the complete state space exhaustively (bounded model
+   checking to depth N, or full unbounded proof). Simulation checks specific
+   scenarios; formal checks all scenarios up to a bound. Formal excels at
+   finding corner cases that random simulation misses. Limitations: state space
+   explosion on large designs, manual effort writing properties, some designs
+   are too large for full formal proof.
+
+---
+
+Q: What is bounded model checking (BMC) vs unbounded proof in formal?
+A: BMC checks all paths of depth <= N clock cycles from reset — proves the
+   property can't be violated in N steps. Complete up to that bound but doesn't
+   prove correctness for all time.
+   Unbounded proof (k-induction, IC3/PDR) attempts to prove the property holds
+   for all time by finding an inductive invariant.
+   BMC: good for bug-hunting (faster, finds shallow bugs).
+   Unbounded: needed for true sign-off on critical properties.
+   Most industrial flows use BMC to a depth covering protocol completion, then
+   verify critical properties to full depth.
+
+---
+
+Q: What is an assume property in formal verification context?
+A: In formal, assume property defines constraints on the input space — the tool
+   only explores input sequences that satisfy the assumptions. This models the
+   design's operating environment (e.g., "CS never deasserts mid-frame in normal
+   operating mode"). Without assumptions, the formal tool explores every possible
+   input combination including physically impossible ones, leading to false
+   failures. Getting assumptions right is critical — overly restrictive
+   assumptions can hide real bugs by constraining away the scenarios where
+   they occur.
+
+--------------------------------------------------------------------------------
+STATIC TIMING ANALYSIS (STA)
+--------------------------------------------------------------------------------
+
+Q: What is setup time and hold time, and what happens when they're violated?
+A: Setup time: minimum time a signal must be stable BEFORE the clock edge for a
+   flip-flop to reliably capture it. Setup violation -> flop may sample the
+   wrong (old) value or go metastable.
+   Hold time: minimum time a signal must remain stable AFTER the clock edge.
+   Hold violation -> flop captures a new value that "chases" the clock edge —
+   more dangerous because it's a function of physical gate delays and can't be
+   fixed by changing clock frequency. Hold violations must be fixed by inserting
+   buffer delay in the data path.
+
+---
+
+Q: What is slack in timing analysis?
+A: Slack = (required arrival time) - (actual arrival time).
+   Positive slack: signal arrives before deadline — timing passes with margin.
+   Negative slack: signal arrives late — timing fails.
+   Setup slack: margin before the capturing edge.
+   Hold slack: margin after the launching edge.
+   Timing sign-off requires positive setup AND hold slack across all
+   process-voltage-temperature (PVT) corners.
+
+---
+
+Q: What is a false path and a multicycle path constraint?
+A: False path: a timing path that physically exists in the netlist but is never
+   exercised during functional operation. Telling STA to ignore it prevents
+   false violations. Example: a scan path used only during test mode.
+   Multicycle path: a path that by design takes more than one clock cycle to
+   propagate. STA is told to check it at cycle N rather than cycle 1.
+   Example: a slow control register that updates only every 4 cycles.
+   Both require intimate knowledge of the design to apply correctly — wrong
+   constraints cause real violations to be ignored.
+
+--------------------------------------------------------------------------------
+VERIFICATION PLANNING
+--------------------------------------------------------------------------------
+
+Q: What is a verification plan (vplan) and what goes in it?
+A: A verification plan maps design features to verification tasks. For each
+   feature in the spec, the vplan defines:
+   - What testbench stimulus will exercise it
+   - What assertions will check protocol invariants
+   - What coverage points will measure completeness
+   - What the acceptance criteria are (coverage goals, assertion pass rate)
+   The vplan is written BEFORE the testbench and drives what gets built.
+   In a tape-out flow, the vplan is signed off by design and verification
+   together — it's the contract for what "done" means.
+
+---
+
+Q: What is a regression and how do you manage seed-based randomization?
+A: A regression is a set of tests run automatically (usually in CI) to catch
+   regressions — bugs introduced by new changes. For constrained random tests,
+   each run uses a different random seed (the seed initializes the constraint
+   solver's random state). A typical regression runs 50-200 seeds per test.
+   If a seed finds a bug, you record it — that seed is added to the must-pass
+   list and re-run on every future regression. The seed makes failures
+   reproducible: same seed = same random sequence = same bug.
+
+---
+
+Q: What is a coverage exclusion and when is it legitimate to use one?
+A: A coverage exclusion removes a bin or coverpoint from the coverage
+   calculation. Legitimate reasons:
+   - Architectural impossibility (writing to a read-only register)
+   - Unreachable RTL code due to parameterization
+   - Test-mode-only logic
+   Exclusions must be reviewed and justified — frequently abused to inflate
+   coverage numbers without closing holes. A legitimate exclusion has a written
+   justification tied to the spec.
+   ILLEGITIMATE: "this bin was hard to hit" — that's a reason to write a
+   directed test, not exclude it.
+
+
+================================================================================
+LEVEL 4 — SENIOR (5+ YEARS)
+Architecture ownership, mentoring, tool flows, methodology decisions
+================================================================================
+
+--------------------------------------------------------------------------------
+ADVANCED UVM / METHODOLOGY
+--------------------------------------------------------------------------------
+
+Q: You are building a new verification environment for an AXI4 interconnect.
+   How do you structure the UVM environment?
+A: AXI4 has separate address/data/response channels for read and write, plus
+   multiple master and slave ports. Structure:
+   - One axi4_agent per master port (active — drives AR/AW/W, monitors R/B)
+   - One axi4_agent per slave port (passive — monitors AR/AW/W, drives R/B
+     through a slave model)
+   - A memory model as the reference scoreboard
+   - Virtual sequences at env level coordinate traffic across masters
+     (concurrent reads/writes, address overlap, reordering)
+   - Coverage: burst length x burst type x response code x address alignment
+   - Assertions: VALID before READY, LAST on correct beat, no ID reuse before
+     response
+   Reuse the same AXI4 agent VIP across projects — that's the investment that
+   pays back.
+
+---
+
+Q: What is a UVM virtual sequence and when do you need one?
+A: A virtual sequence coordinates multiple sequencers simultaneously — it runs
+   sub-sequences on different agents in a controlled order.
+   Example: SPI master writes config register, then ADC data sequencer starts
+   a conversion, then SPI master reads back the result. Without a virtual
+   sequence, these are independent — you can't guarantee the config write
+   completes before the conversion starts.
+
+   class config_then_convert_vseq extends uvm_sequence;
+       spi_sequencer spi_sqr;
+       adc_sequencer adc_sqr;
+
+       task body();
+           spi_write_seq wr   = spi_write_seq::type_id::create("wr");
+           adc_convert_seq cv = adc_convert_seq::type_id::create("cv");
+
+           wr.start(spi_sqr);   // config write completes first
+           cv.start(adc_sqr);   // then conversion starts
+       endtask
+   endclass
+
+---
+
+Q: How do you verify a design that has both SPI and an internal FIFO?
+   What are the interesting coverage scenarios?
+A: Interesting scenarios:
+   - Write via SPI until FIFO full, then write one more (overflow behavior)
+   - Read via SPI until FIFO empty, then read one more (underflow behavior)
+   - Fill FIFO to exactly 1 entry, read it — boundary condition
+   - Write and read simultaneously (concurrent access) at same clock cycle
+   - Burst writes followed by burst reads — verify FIFO ordering (not LIFO)
+   - Reset during mid-FIFO-fill — FIFO clears correctly
+   Coverage: FIFO occupancy bins (empty/1/half/almost-full/full), operation
+   type (wr/rd) crossed with occupancy level, SPI address crossed with FIFO
+   command type.
+
+---
+
+Q: You take over a verification environment where coverage is stuck at 72%
+   for 3 months. Walk me through your investigation.
+A: Step 1: Get full per-coverpoint breakdown — identify which specific bins are
+           at 0%, not just overall percentage.
+   Step 2: Classify holes:
+           (a) Physically impossible -> write coverage exclusion with justification
+           (b) Requires specific sequence -> write directed test
+           (c) Requires constraint bias -> add weighted dist to stress scenario
+           (d) Bug in coverage model (wrong iff condition, wrong bin values)
+               -> fix the coverage code
+   Step 3: Check if 72% is stable or slowly growing — stable means random seeds
+           have saturated and more random runs won't help.
+   Step 4: Review constraint classes — are illegal_bins or ignore_bins
+           accidentally excluding scenarios that should be tested?
+   Step 5: Review RTL vs coverage model alignment — do bin values match actual
+           RTL behavior?
+
+---
+
+Q: What is assertion-based verification (ABV) and how do you decide which
+   properties to formalize?
+A: ABV embeds temporal properties directly in the design or testbench as
+   concurrent assertions that run throughout simulation and formal verification.
+   Properties to formalize:
+   (1) Protocol invariants — CS never goes high mid-transaction
+   (2) Handshake rules — req must be high until ack
+   (3) Data integrity — data written must equal data read back from same address
+   (4) Safety properties — a hardware error flag must never deassert without reset
+   (5) Liveness properties — a request must eventually be acknowledged
+   Focus on properties hard to check with a scoreboard (timing, ordering,
+   never-happen conditions) and critical for correctness.
+
+--------------------------------------------------------------------------------
+POWER-AWARE VERIFICATION
+--------------------------------------------------------------------------------
+
+Q: What is UPF and what does it add to the verification flow?
+A: UPF (Unified Power Format) defines power intent — which logic blocks are in
+   which power domains, what voltage levels they operate at, how isolation cells
+   and level shifters are inserted at domain crossings, and what happens during
+   power state transitions. Power-aware simulation models isolation cells
+   clamping outputs during power-down, retention registers preserving state, and
+   X-propagation through powered-down domains. Verification must check that
+   power state transitions don't corrupt functional state and that isolation is
+   correctly applied at every crossing.
+
+--------------------------------------------------------------------------------
+DEBUG & ANALYSIS
+--------------------------------------------------------------------------------
+
+Q: A test that passed 100 times suddenly fails on seed 54321. Walk me through
+   reproducing and isolating the bug.
+A: Step 1: Re-run with same seed to confirm reproducibility:
+           xrun ... +ntb_random_seed=54321
+   Step 2: Enable waveform dumping for that seed:
+           $dumpfile("fail.vcd"); $dumpvars(0, tb)
+   Step 3: Find the first error message — timestamp tells you when it happened.
+           Look at 5-10 transactions before that point in the waveform.
+   Step 4: Add tx.print("DRV") logging in the driver to see exactly what
+           stimulus was generated. Compare against monitor output — divergence
+           tells you if driver or DUT is wrong.
+   Step 5: Binary search the transaction stream — run only the first half.
+           If pass, bug is in second half. Repeat until minimum reproducing
+           sequence is isolated.
+   Step 6: Write a directed test that hardcodes that exact sequence — now you
+           have a regression test that catches this bug permanently.
+
+---
+
+Q: What is X-propagation and why is it one of the most insidious simulation bugs?
+A: In SV simulation, uninitialized signals have value X (unknown). X propagates
+   through logic conservatively — any operation on X that could produce a
+   different result depending on whether X is 0 or 1 produces X.
+   The bug: synthesis tools resolve X to 0 or 1 (they must pick something), but
+   simulation keeps it as X. A design that works correctly in simulation with X's
+   can have completely different behavior in silicon if those X's are resolved
+   differently than the simulator assumed.
+   Common sources: uninitialized registers after reset, incomplete case
+   statements (missing default), power-up state of flip-flops.
+   Fix: use X-propagation tools or $test$plusargs("enable_x_check") to find
+   X's before tape-out.
+
+---
+
+Q: What is a simulation performance bottleneck and how do you profile it?
+A: Large verification environments spend simulation time on:
+   (1) Constraint solving (complex CRV with many variables)
+   (2) Waveform dumping (dumping entire hierarchy is very slow — scope-limit
+       your dumpvars)
+   (3) Display messages (thousands of $display calls per cycle)
+   (4) Coverage sampling (complex cross coverage calculated every transaction)
+   Profile with: Xcelium's -simprofile flag generates a report of where time
+   was spent.
+   Common fixes: reduce waveform dump scope, remove or conditionalize debug
+   displays, reduce constraint complexity by pre-solving distributions outside
+   randomize(), or split a monolithic test into parallel shorter tests.
+
+--------------------------------------------------------------------------------
+IMPLEMENTATION PRACTICE PROBLEMS
+--------------------------------------------------------------------------------
+
+Q: Implement a parameterized scoreboard that works for any register file size.
+
+   module generic_rf_scoreboard #(
+       parameter int ADDR_BITS = 7,
+       parameter int DATA_BITS = 8,
+       parameter int NUM_REGS  = 8
+   ) (
+       input logic                  txn_valid,
+       input logic                  rw,
+       input logic                  aborted,
+       input logic [ADDR_BITS-1:0]  addr,
+       input logic [DATA_BITS-1:0]  data_byte,
+       input logic [DATA_BITS-1:0]  readback_byte
+   );
+       logic [DATA_BITS-1:0] model_rf [0:NUM_REGS-1];
+       integer fail_count = 0;
+
+       initial foreach (model_rf[i]) model_rf[i] = '0;
+
+       always @(posedge txn_valid) begin
+           if (!aborted && addr < NUM_REGS) begin
+               if (!rw)
+                   model_rf[addr] = data_byte;
+               else if (readback_byte !== model_rf[addr]) begin
+                   fail_count++;
+                   $error("FAIL addr=0x%0h exp=0x%0h got=0x%0h",
+                           addr, model_rf[addr], readback_byte);
+               end
+           end
+       end
+
+       final $display("[SB] Total failures: %0d", fail_count);
+   endmodule
+
+---
+
+Q: Write a covergroup using transition bins instead of a manual flag for
+   write-then-read detection.
+
+   covergroup spi_sequence_cg @(posedge txn_valid);
+
+       cp_rw: coverpoint rw iff (!aborted) {
+           bins write = {0};
+           bins read  = {1};
+       }
+
+       // Transition coverage replaces manual cur_wr_then_rd_same_addr flag
+       cp_rw_seq: coverpoint rw iff (!aborted) {
+           bins wr_then_rd      = (0 => 1);    // write immediately followed by read
+           bins rd_then_wr      = (1 => 0);
+           bins consecutive_wr  = (0 => 0);
+           bins consecutive_rd  = (1 => 1);
+       }
+
+       cp_addr: coverpoint addr iff (!aborted) {
+           bins valid_addrs[] = {[7'h00:7'h03]};
+           bins illegal = default;
+       }
+
+       rw_seq_x_addr: cross cp_rw_seq, cp_addr;
+
+   endgroup
+
+---
+
+Q: Your drive_spi_txn task handles SPI_EXTRA_CLOCKS by sending 16 bits then
+   extra zeros. What is wrong with this and how do you fix it?
+A: For SPI_EXTRA_CLOCKS, after send_stream_bits(frame_bits, 16) it calls
+   send_extra_zeros(tx.extra_clocks) while CS is still low. The DUT FSM may
+   not expect more clocks after the 16th. Depending on the implementation it
+   might: (a) latch garbage into an internal shift register, (b) reset on CS
+   high regardless, (c) enter an undefined state.
+   Fix depends on the design spec:
+   - If extra clocks with CS low must be defined behavior, add an FSM state to
+     handle it and write an assertion verifying the DUT returns to idle.
+   - If it's undefined, document it as illegal stimulus and only use in the
+     stress class where undefined behavior is expected and the scoreboard
+     ignores the transaction.
+
+---
+
+Q: How would you add timeout detection to catch a scenario where txn_valid
+   never fires?
+
+   task automatic drive_with_timeout(input spi_txn tx, input int timeout_cycles = 100);
+       fork
+           begin : drive_thread
+               drive_spi_txn(tx);
+           end
+           begin : timeout_thread
+               repeat (timeout_cycles) @(posedge sclk);
+               $error("TIMEOUT: transaction did not complete in %0d cycles",
+                       timeout_cycles);
+               disable drive_thread;
+           end
+       join_any
+       disable fork;
+   endtask
+
+   // Or via assertion in the monitor:
+   property p_max_frame_length;
+       @(posedge sclk) $fell(cs_n) |-> ##[1:20] $rose(cs_n);
+   endproperty
+   assert property (p_max_frame_length)
+       else $error("Frame exceeded maximum length");
+
+--------------------------------------------------------------------------------
+THEORY & METHODOLOGY DEEP-DIVES
+--------------------------------------------------------------------------------
+
+Q: What is the difference between white-box, grey-box, and black-box
+   verification?
+A: Black-box: testbench has no knowledge of DUT internals — only drives inputs
+   and checks outputs against the spec. Most portable and spec-driven but may
+   miss internal corner cases.
+   Grey-box: testbench observes some internal signals (like dut.bit_count and
+   dut.cmd_valid in the assertions module) to write better assertions and
+   coverage — not driving them, just observing. This is the standard approach.
+   White-box: testbench has full knowledge of internal state and uses it to
+   guide stimulus generation. Most powerful for finding bugs but tightly
+   coupled to the implementation — changes to internals break the testbench.
+
+---
+
+Q: What is mutation testing and why is it used to validate a verification
+   environment?
+A: Mutation testing deliberately injects small bugs into the RTL (flip a bit,
+   change an operator, delete an assignment) and checks whether your testbench
+   catches the bug. If your verification environment misses a mutation, you have
+   a coverage or assertion hole — either the scenario that would expose the bug
+   was never stimulated, or the scoreboard/assertion doesn't check the affected
+   output. A good verification environment should catch >95% of single mutations.
+   This is how you validate the testbench itself — your tests might all pass not
+   because the DUT is correct, but because the testbench has blind spots.
+
+---
+
+Q: What is the verification closure criteria for a block-level tape-out
+   handoff?
+A: Typical industry criteria (varies by company/project):
+   - Functional coverage: 100% with all exclusions justified and reviewed
+   - Code coverage: line >= 95%, branch >= 90%, toggle >= 85%,
+     FSM state/transition >= 100%
+   - Assertion density: all spec requirements have at least one assertion
+   - Assertion pass rate: 100% across all regression seeds
+   - Regression: passes consistently across >= 50 random seeds per test
+   - Directed tests: all corner cases in vplan have dedicated passing tests
+   - CDC: formal CDC clean or all violations waived with justification
+   - Lint: clean or all violations reviewed and waived
+   - Sign-off review: design and verification engineers sign off the vplan
+
+---
+
+Q: Tell me about a time you found a bug that simulation missed. What was the
+   root cause?
+A: [Use your SPI project — frame it as follows:]
+   The 88.89% coverage plateau — the cp_wr_then_rd_same_addr: yes bin at 0%
+   meant a write-then-read sequence to the same address was never verified.
+   A bug in the register file's read-back path (incorrect address muxing that
+   only manifests when read immediately follows write) would have been completely
+   undetected by 500 stress transactions. The directed test not only closed
+   coverage but effectively verified that specific data hazard path.
+   This is a common class of bug in register files — combinational forwarding
+   or stale pipeline state that only appears in specific transaction sequences.
+   Random testing doesn't generate ordered sequences reliably — directed tests
+   are required for sequence-dependent bugs.
+
+
+================================================================================
+QUICK REFERENCE — COMMON INTERVIEW GOTCHAS
+================================================================================
+
+Gotcha                          | Common Wrong Answer     | Correct Answer
+--------------------------------|-------------------------|---------------------------
+rand vs randc                   | "randc is random"       | randc cycles all values first
+randomize() return value        | ignored                 | always check or void'()
+blocking in always_ff           | "it works the same"     | race conditions in sim
+monitor driving signals         | "for observability"     | never — passive only
+code cov = functional cov       | treated as same         | completely different metrics
+1000 passing = verified         | "yes"                   | depends entirely on coverage
+$display timing                 | "prints final value"    | prints mid-timestep
+X in simulation                 | "same as 0"             | synthesis resolves differently
+formal assume = assert          | treated as same         | assume constrains inputs
+CDC sync for multi-bit          | "use 2-flop sync"       | 2-flop only for single bits
+|-> vs |=>                      | "same thing"            | same-cycle vs next-cycle
+disable iff                     | "disables assertion"    | suspends it (vacuous pass)
+false path vs multicycle path   | confused                | false=never active, multi=N cycles
+shadow vs behavioral model      | same thing              | shadow mirrors impl, behav mirrors spec
+coverage exclusion              | "always ok to use"      | must be justified against spec
+
+
+================================================================================
+"TELL ME ABOUT A PROJECT" — USE YOUR SPI WORK
+================================================================================
+
+"Tell me about a verification challenge you faced."
+-> The cp_wr_then_rd_same coverage bin stuck at 0% despite 500 stress
+   transactions. Diagnosed by adding per-coverpoint get_coverage() calls in
+   the final block. Fixed with a directed test after the random phase forcing
+   write then read to the same address in sequence. Coverage went from 88.89%
+   to 100%.
+
+"Have you used constrained random verification?"
+-> Walk through spi_legal_txn vs spi_stress_txn. Explain the dist weights and
+   conditional constraints. Explain why both exist (baseline correctness vs
+   corner case stress). Mention the two-class pattern as standard methodology.
+
+"How did you know when your design was verified enough?"
+-> Explain coverage closure. The 88.89% -> 100% journey. The difference
+   between zero failures and actual coverage percentage. Discuss that 0
+   failures with 60% coverage is worse than 0 failures with 100% coverage
+   because the first has unknown blind spots.
+
+"Have you debugged a simulation issue?"
+-> The -coverage all flag missing in EDA Playground causing 0.00% despite
+   transactions running correctly. Diagnosed by adding $display inside the
+   sampling block. Fixed by adding the compile flag. Also the void'() and
+   mid-block declaration compiler errors from Xcelium — walked through each
+   error message methodically and resolved the root causes.
+
+"Tell me about your testbench architecture."
+-> Describe the four-component architecture: CRV (two constraint classes for
+   legal and stress traffic), monitor (passive, reconstructs protocol frames
+   from pin-level signals), scoreboard (shadow register file model, compares
+   every read against expected state), coverage (covergroup with crosses for
+   addr x rw, transition bins for sequencing, iff guards for abort filtering).
+   Explain how monitor txn_valid wires all three passive components together.
+
+"What would you do differently if you were starting over?"
+-> Use an interface to bundle SPI signals instead of individual ports — cleaner
+   connection to all testbench components. Use transition bins in the covergroup
+   instead of the manual cur_wr_then_rd_same_addr logic. Add a virtual interface
+   so the monitor and driver could be promoted to class-based components (first
+   step toward UVM). Add a timeout assertion in the monitor so hung transactions
+   are caught automatically instead of requiring manual inspection.
+
+
+================================================================================
+END OF INTERVIEW QUESTION BANK
+SPI Interface Verification — 8-bit SAR ADC Project
+================================================================================

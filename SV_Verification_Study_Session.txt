@@ -1,0 +1,854 @@
+================================================================================
+SYSTEMVERILOG VERIFICATION — FULL STUDY SESSION
+SPI Interface Project | 8-bit SAR ADC
+================================================================================
+
+
+================================================================================
+SECTION 1: SYNTAX SUMMARY — CRV, MONITOR, SCOREBOARD, COVERAGE
+================================================================================
+
+--------------------------------------------------------------------------------
+1.1 CRV — CONSTRAINED RANDOM VERIFICATION (crv.sv)
+--------------------------------------------------------------------------------
+
+PURPOSE: Generate legal and illegal stimulus automatically instead of writing
+directed tests by hand.
+
+--- BASE TRANSACTION CLASS ---
+
+typedef enum int {
+    SPI_FULL,
+    SPI_ABORT_MID_CMD,
+    SPI_ABORT_MID_DATA,
+    SPI_EXTRA_CLOCKS
+} spi_frame_kind_e;
+
+class spi_txn;
+    rand bit              rw;               // randomizable scalar
+    rand bit [6:0]        addr;             // randomizable vector
+    rand bit [7:0]        data;
+    rand int unsigned     gap_cycles;       // randomizable int
+    rand spi_frame_kind_e frame_kind;       // randomizable enum
+    rand int unsigned     abort_after_bits;
+    rand int unsigned     extra_clocks;
+endclass
+
+--- LEGAL TRANSACTION (happy path) ---
+
+class spi_legal_txn extends spi_txn;
+    constraint c_legal {
+        addr inside {7'h00, 7'h01, 7'h02, 7'h03};  // set membership
+        frame_kind == SPI_FULL;                      // equality
+        gap_cycles inside {[1:5]};                   // range
+        rw dist {0 := 1, 1 := 1};                   // weighted distribution
+        abort_after_bits == 0;
+        extra_clocks == 0;
+    }
+endclass
+
+--- STRESS TRANSACTION (corner cases, protocol violations) ---
+
+class spi_stress_txn extends spi_txn;
+    constraint c_stress {
+        rw dist {0 := 1, 1 := 1};
+
+        addr dist {
+            [7'h00:7'h03] := 70,    // 70% in legal space
+            [7'h04:7'h7F] := 30     // 30% outside (unsupported)
+        };
+
+        gap_cycles inside {[0:2]};  // back-to-back traffic
+
+        frame_kind dist {
+            SPI_FULL           := 40,
+            SPI_ABORT_MID_CMD  := 20,
+            SPI_ABORT_MID_DATA := 20,
+            SPI_EXTRA_CLOCKS   := 20
+        };
+
+        // Conditional constraints
+        if (frame_kind == SPI_FULL) {
+            abort_after_bits == 0;
+            extra_clocks == 0;
+        }
+        if (frame_kind == SPI_ABORT_MID_CMD) {
+            abort_after_bits inside {[1:7]};
+            extra_clocks == 0;
+        }
+        if (frame_kind == SPI_ABORT_MID_DATA) {
+            abort_after_bits inside {[9:15]};
+            extra_clocks == 0;
+        }
+        if (frame_kind == SPI_EXTRA_CLOCKS) {
+            abort_after_bits == 0;
+            extra_clocks inside {[1:8]};
+        }
+    }
+endclass
+
+--- USAGE IN TESTBENCH ---
+
+spi_legal_txn txn = new();
+txn.randomize();                              // solve constraints, fill rand fields
+txn.randomize() with { addr == 7'h01; };     // inline override (one call only)
+txn.addr.rand_mode(0);                        // freeze one field
+txn.c_legal.constraint_mode(0);              // disable entire constraint block
+
+// Always check return value (1=success, 0=failure):
+if (!txn.randomize()) $fatal("randomize failed");
+
+// Or discard explicitly:
+void'(txn.randomize() with { rw == 0; addr == 7'h00; });
+
+--- KEY OPERATORS ---
+
+Operator          | Meaning                          | Example
+------------------|----------------------------------|--------------------------------
+rand              | field is randomizable            | rand bit [7:0] data
+randc             | cycles all values before repeat  | randc bit [3:0] x
+constraint        | constraint block                 | constraint c { ... }
+inside { }        | set/range membership             | x inside {[0:5], 8'hFF}
+dist { := }       | weight per value/range item      | x dist {0 := 1, 1 := 1}
+dist { :/ }       | weight shared across range       | x dist {[0:3] :/ 50}
+if ( ) { }        | conditional constraint           | if (a) { b == 0; }
+
+
+--------------------------------------------------------------------------------
+1.2 MONITOR (spi_monitor.sv)
+--------------------------------------------------------------------------------
+
+PURPOSE: Passively observe DUT signals and reconstruct protocol-level
+transactions. NEVER drives the DUT.
+
+Data flow: Signals in -> sample on clock edges -> build packet -> output txn_valid
+
+module spi_monitor (
+    input  logic        sclk, cs_n, mosi, miso,
+    output logic        txn_valid, frame_done, aborted,
+    output logic        rw,
+    output logic [6:0]  addr,
+    output logic [7:0]  cmd_byte, data_byte, readback_byte
+);
+    logic [7:0] cmd_shift, data_shift, read_shift;
+    logic [4:0] bit_count;
+    logic       in_frame;
+
+    // Reset state on declaration
+    initial begin
+        in_frame  = 1'b0;
+        txn_valid = 1'b0;
+        bit_count = '0;
+        // ... initialize all outputs
+    end
+
+    // Frame start — trigger on CS assertion
+    always @(negedge cs_n) begin
+        in_frame  <= 1'b1;
+        txn_valid <= 1'b0;
+        bit_count <= '0;
+        cmd_shift <= '0;
+    end
+
+    // Sample bus — every SCLK rising edge
+    always @(posedge sclk) begin
+        if (!cs_n && in_frame) begin
+            if (bit_count < 5'd8)
+                cmd_shift <= {cmd_shift[6:0], mosi};    // shift in MSB-first
+            else
+                data_shift <= {data_shift[6:0], mosi};
+
+            bit_count <= bit_count + 5'd1;
+        end
+    end
+
+    // Frame end — trigger on CS de-assertion
+    always @(posedge cs_n) begin
+        if (in_frame) begin
+            txn_valid <= 1'b1;
+            aborted   <= (bit_count != 5'd16);  // incomplete = abort
+            in_frame  <= 1'b0;
+        end
+    end
+endmodule
+
+KEY RULES:
+- Monitor is passive — only inputs from DUT, outputs only toward scoreboard/coverage
+- Use initial begin to set deterministic reset state
+- Detect frame boundaries using protocol-specific edges (negedge cs_n, posedge cs_n)
+- Set a valid strobe (txn_valid) so downstream modules know when data is stable
+
+
+--------------------------------------------------------------------------------
+1.3 SCOREBOARD (spi_scoreboard.sv)
+--------------------------------------------------------------------------------
+
+PURPOSE: Maintain a golden reference model; compare DUT outputs against
+expected values and flag mismatches.
+
+Data flow: Monitor outputs -> scoreboard -> compare actual vs model -> pass/fail
+
+module spi_scoreboard (
+    input logic        txn_valid, rw, aborted,
+    input logic [6:0]  addr,
+    input logic [7:0]  data_byte, readback_byte
+);
+    // Reference model — mirror of DUT's internal register file
+    logic [7:0] model_rf [0:7];
+    integer write_count, read_count, abort_count, pass_count, fail_count;
+
+    // Initialize to match RTL reset values — MUST match spec exactly
+    initial begin
+        model_rf[7'h00] = 8'h00;   // ADC_CFG default
+        model_rf[7'h01] = 8'h55;   // ADC_RESULT default
+        model_rf[7'h02] = 8'h00;   // STATUS default
+        model_rf[7'h03] = 8'h00;   // PGA_CTRL default
+        write_count = 0; read_count = 0; fail_count = 0;
+    end
+
+    always @(posedge txn_valid) begin
+        if (aborted) begin
+            abort_count++;
+        end
+        else if (!supported_addr(addr)) begin
+            unsupported_count++;
+        end
+        else if (!rw) begin
+            // Write: update reference model
+            model_rf[addr[2:0]] = data_byte;
+            write_count++;
+        end
+        else begin
+            // Read: compare actual vs expected
+            read_count++;
+            if (readback_byte == model_rf[addr[2:0]])
+                pass_count++;
+            else
+                $error("[SB] FAIL: addr=0x%0h expected=0x%0h got=0x%0h",
+                        addr, model_rf[addr[2:0]], readback_byte);
+        end
+    end
+
+    // Runs exactly once after $finish
+    final begin
+        $display("[SB] Writes=%0d Reads=%0d Aborts=%0d Failures=%0d",
+                  write_count, read_count, abort_count, fail_count);
+    end
+endmodule
+
+KEY SYSTEM TASKS:
+Task          | When to Use
+--------------|---------------------------------------------------------------
+$display(...) | Regular info messages
+$error(...)   | Non-fatal mismatch — simulation continues, count failures
+$fatal(...)   | Fatal — stops simulation (broken model, impossible state)
+$warning(...) | Suspicious but non-blocking
+final begin   | Runs exactly once at end-of-simulation (after $finish)
+
+
+--------------------------------------------------------------------------------
+1.4 FUNCTIONAL COVERAGE (spi_coverage.sv)
+--------------------------------------------------------------------------------
+
+PURPOSE: Measure which interesting scenarios have been exercised.
+Answers "have we tested enough?" not "is the DUT correct?"
+
+module spi_coverage (
+    input logic sclk, cs_n, txn_valid, aborted,
+    input logic rw,
+    input logic [6:0] addr,
+    input logic [7:0] data_byte
+);
+    // Covergroup with manual sampling function
+    covergroup spi_cg with function sample(
+        bit aborted_s,
+        bit rw_s,
+        bit [6:0] addr_s,
+        bit [7:0] data_s,
+        bit back_to_back_s,
+        bit wr_then_rd_same_addr_s,
+        bit supported_s
+    );
+
+    // Coverpoint — tracks which values a variable hits
+    cp_abort: coverpoint aborted_s {
+        bins complete = {0};
+        bins abort    = {1};
+    }
+
+    // iff = sampling guard, only sample when condition is true
+    cp_rw: coverpoint rw_s iff (!aborted_s) {
+        bins write = {0};
+        bins read  = {1};
+    }
+
+    cp_addr: coverpoint addr_s iff (!aborted_s) {
+        bins adc_cfg    = {7'h00};
+        bins adc_result = {7'h01};
+        bins status     = {7'h02};
+        bins pga_ctrl   = {7'h03};
+        bins unsupported = default;    // catch-all bin
+    }
+
+    cp_data: coverpoint data_s iff (!aborted_s && !rw_s) {
+        bins zero     = {8'h00};
+        bins all_ones = {8'hFF};
+        bins walk_aa  = {8'hAA};
+        bins walk_55  = {8'h55};
+        bins other    = default;
+    }
+
+    cp_back_to_back:   coverpoint back_to_back_s       { bins no={0}; bins yes={1}; }
+    cp_wr_then_rd_same: coverpoint wr_then_rd_same_addr_s { bins no={0}; bins yes={1}; }
+
+    // Cross coverage — cartesian product of two coverpoints
+    rw_x_addr:      cross cp_rw, cp_addr;       // every addr accessed by both read+write
+    rw_x_supported: cross cp_rw, cp_supported;
+
+    endgroup
+
+    spi_cg cg = new();
+
+    // Sample on every completed transaction
+    always @(posedge txn_valid) begin
+        cg.sample(aborted, rw, addr, data_byte,
+                  cur_back_to_back, cur_wr_then_rd_same_addr, cur_supported);
+    end
+
+    // Per-coverpoint breakdown for debugging
+    final begin
+        $display("[COV] Total          = %0.2f%%", cg.get_inst_coverage());
+        $display("[COV] cp_abort       = %0.2f%%", cg.cp_abort.get_coverage());
+        $display("[COV] cp_rw          = %0.2f%%", cg.cp_rw.get_coverage());
+        $display("[COV] cp_addr        = %0.2f%%", cg.cp_addr.get_coverage());
+        $display("[COV] cp_data        = %0.2f%%", cg.cp_data.get_coverage());
+        $display("[COV] cp_back_to_back= %0.2f%%", cg.cp_back_to_back.get_coverage());
+        $display("[COV] cp_wr_then_rd  = %0.2f%%", cg.cp_wr_then_rd_same.get_coverage());
+        $display("[COV] rw_x_addr      = %0.2f%%", cg.rw_x_addr.get_coverage());
+        $display("[COV] rw_x_supported = %0.2f%%", cg.rw_x_supported.get_coverage());
+    end
+endmodule
+
+BIN TYPES:
+Syntax                    | Meaning
+--------------------------|--------------------------------------------------
+bins x = {val}            | Single named bin
+bins x = {[lo:hi]}        | Range bin
+bins x[] = {[lo:hi]}      | Auto-split: one bin per value in range
+bins x = default          | Catch-all for all uncovered values
+illegal_bins x = {val}    | Marks value as illegal — error if hit
+ignore_bins x = {val}     | Exclude from coverage calculation entirely
+iff (cond)                | Conditional sampling guard
+
+
+--------------------------------------------------------------------------------
+1.5 VERIFICATION ARCHITECTURE — HOW IT ALL CONNECTS
+--------------------------------------------------------------------------------
+
+                +---------------------+
+   CRV txn ---> |     Testbench       | --- drives ---> DUT
+                |  (stimulus driver)  |
+                +---------------------+
+                          |
+                    DUT signals (sclk, cs_n, mosi, miso)
+                          |
+                +---------v----------+
+                |      Monitor       |  <- passive observer only
+                +------+------+------+
+                       |      |
+              +--------v-+  +-v----------+
+              |Scoreboard|  |  Coverage  |
+              |(correct?)|  |  (enough?) |
+              +----------+  +------------+
+
+
+================================================================================
+SECTION 2: KEY CONCEPTS & DISCUSSIONS FROM THIS SESSION
+================================================================================
+
+--------------------------------------------------------------------------------
+2.1 IS CRV ONLY FOR PROTOCOL/TRANSACTION DESIGNS?
+--------------------------------------------------------------------------------
+
+No. CRV scales to any design. The "transaction" just changes:
+
+Design         | Transaction          | Reference Model
+---------------|----------------------|--------------------------------
+SPI Interface  | 16-bit frame         | 4-register file
+RISC-V Core    | 32-bit instruction   | 32 GPRs + PC + memory
+AXI Bus        | Read/Write burst     | Memory model
+UART           | Data byte + framing  | FIFO state
+DDR Controller | Memory command       | Full memory array
+
+For RISC-V, constraints generate legal instruction encodings:
+
+class riscv_instr_txn;
+    rand bit [6:0] opcode;
+    rand bit [4:0] rd, rs1, rs2;
+    rand bit [2:0] funct3;
+    rand bit [11:0] imm;
+
+    constraint c_legal_opcodes {
+        opcode inside {
+            7'b0110011,   // R-type (add, sub, and)
+            7'b0010011,   // I-type (addi, ori)
+            7'b0000011,   // Load
+            7'b0100011    // Store
+        };
+    }
+    constraint c_no_x0_write {
+        rd != 5'd0;   // writing to x0 is pointless
+    }
+endclass
+
+The industry uses RISC-V DV (Google's open-source framework) — a giant CRV
+environment that generates random instruction streams, runs them on RTL and
+on a golden ISS (like Spike), and the scoreboard compares every register
+write and memory access. CRV is MORE necessary for a complex core than for
+SPI — the search space of instruction sequences is enormous.
+
+
+--------------------------------------------------------------------------------
+2.2 CAN YOU CLAIM "FULLY VERIFIED" WITH 1000 PASSING TRANSACTIONS?
+--------------------------------------------------------------------------------
+
+NO. Zero failures tells you the DUT agreed with the reference model for those
+specific 1000 scenarios. It does NOT tell you:
+
+1. COVERAGE HOLES — if rw_x_addr cross never hit a read from ADC_RESULT_ADDR,
+   that scenario was never tested even across 1000 transactions.
+
+2. WRONG REFERENCE MODEL — if model_rf initializes ADC_RESULT_ADDR=0x55 but
+   RTL default is 0xAA, both agree on the wrong answer for all 1000 tests.
+
+3. UNTESTED PROTOCOL VIOLATIONS — glitches on SCLK, CS mid-bit, MOSI changing
+   on wrong edge. Stress constraints cover some but not all violations.
+
+4. RESET BEHAVIOR — what happens if CS toggles during power-on reset?
+
+5. ASSERTION COVERAGE — passing transactions don't verify timing invariants.
+
+REAL TAPE-OUT CRITERIA:
+- Functional coverage at or near 100% (all coverpoints and crosses hit)
+- Code coverage (line/branch/toggle) above 90%
+- All assertions pass across all scenarios
+- Reference model independently reviewed against the spec
+- Corner cases (reset, glitch, power-on) have dedicated directed tests
+- Regression passing consistently across multiple random seeds
+
+1000 passing tests at 60% coverage is WEAKER than
+200 passing tests at 98% coverage.
+Coverage closure is the real metric, not transaction count.
+
+
+--------------------------------------------------------------------------------
+2.3 DEBUGGING: 0.00% COVERAGE IN EDA PLAYGROUND
+--------------------------------------------------------------------------------
+
+SYMPTOM:
+[COV] Functional Coverage = 0.00%
+[COV] xmsim: *N,COVNSM: Sampling of covergroup "spi_cg" is not enabled.
+
+ROOT CAUSE:
+Xcelium requires explicit coverage collection flags at compile time.
+Without them, cg.sample() is silently ignored.
+
+FIX — Add to EDA Playground "Compile options" field:
+    -coverage all
+
+Or for functional coverage only:
+    -coverage functional
+
+EDA Playground UI location:
+    Tools & Simulators section
+    -> Compile options text box (NOT Run options)
+
+ADDITIONAL DEBUGGING — confirm sampling fires:
+Add inside always @(posedge txn_valid) in spi_coverage.sv:
+    $display("[COV DEBUG] sample fired rw=%0b addr=0x%0h", rw, addr);
+
+If that line prints but coverage stays 0%, the EDA Playground license
+is blocking coverage collection. Use scoreboard results as evidence instead.
+
+
+--------------------------------------------------------------------------------
+2.4 DEBUGGING: 88.89% COVERAGE — FINDING THE MISSING BIN
+--------------------------------------------------------------------------------
+
+OBSERVATION: 88.89% = exactly 8/9
+CONCLUSION: One entire coverpoint is at 0% (not partially hit — completely missed)
+
+DIAGNOSIS — add per-coverpoint breakdown to final block:
+    $display("[COV] cp_wr_then_rd = %0.2f%%", cg.cp_wr_then_rd_same.get_coverage());
+
+ROOT CAUSE: cp_wr_then_rd_same: yes bin
+Requires: complete write to addr X, immediately followed by complete read
+from addr X, with no other valid transaction between them.
+With 309 aborts in the stress run, this sequence kept getting broken.
+
+SCOREBOARD OUTPUT THAT REVEALED IT:
+    [SB] Writes=237  Reads=280  Aborts=309  Failures=0  Unsupported=177
+
+FIX — directed test after random phase:
+
+initial begin
+    spi_legal_txn wr;   // declare at TOP of initial block (Xcelium requirement)
+    spi_legal_txn rd;
+
+    run_stress_crv(500);
+
+    // Directed write-then-read to same address
+    wr = new();
+    rd = new();
+
+    void'(wr.randomize() with { rw == 0; addr == 7'h00; });
+    drive_transaction(wr);
+
+    void'(rd.randomize() with { rw == 1; addr == 7'h00; });
+    drive_transaction(rd);
+
+    repeat (5) @(posedge sclk);
+    $finish;
+end
+
+KEY PATTERN: Random testing closes most bins. Directed tests close stubborn
+ones that require specific sequencing. Getting to 100% almost always needs both.
+
+
+--------------------------------------------------------------------------------
+2.5 COMPILER ERRORS ENCOUNTERED AND FIXES
+--------------------------------------------------------------------------------
+
+ERROR 1: MISEXX — "expecting an '=' or '<=' sign in an assignment"
+CAUSE:  spi_legal_txn wr = new() declared in the middle of a procedural block.
+        Xcelium requires all variable declarations at the TOP of begin...end.
+FIX:    Move spi_legal_txn wr; to the top, assign wr = new() later.
+
+ERROR 2: FUNTSK — "function called as a task without void'()"
+CAUSE:  randomize() returns a bit (success flag). Calling it as a statement
+        without capturing the return value triggers this warning/error.
+FIX:    Use void'(obj.randomize() with { ... });
+        Or better: if (!obj.randomize()) $fatal("randomize failed");
+
+
+================================================================================
+SECTION 3: HOW TO APPLY THIS TO ANY NEW PROJECT
+================================================================================
+
+STEP 1 — Define your transaction class
+    What fields describe one protocol operation?
+    class uart_txn;
+        rand bit [7:0] data;
+        rand bit       parity_error;
+        rand int       baud_gap;
+    endclass
+
+STEP 2 — Write a legal constraint class (happy path)
+    class uart_legal_txn extends uart_txn;
+        constraint c_legal {
+            parity_error == 0;
+            baud_gap inside {[1:10]};
+        }
+    endclass
+
+STEP 3 — Write a stress/error constraint class (corner cases, violations)
+
+STEP 4 — Write the monitor
+    Identify: frame start signal, sample clock, frame end signal, valid strobe
+
+STEP 5 — Write the scoreboard
+    Identify: DUT internal state (registers, FIFOs, counters)
+              what is a "write" (updates model)?
+              what is a "read" (compare against model)?
+
+STEP 6 — Write coverage
+    Identify: addresses/opcodes/modes that must be hit
+              data patterns that matter (0x00, 0xFF, 0xAA, 0x55, walking-1)
+              sequences that matter (write-then-read, back-to-back, abort-retry)
+              cross coverage combinations (addr x rw, mode x error_type)
+
+
+================================================================================
+SECTION 4: INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+--------------------------------------------------------------------------------
+CATEGORY 1: CONCEPTUAL FUNDAMENTALS
+--------------------------------------------------------------------------------
+
+Q: What is the difference between functional verification and design validation?
+A: Functional verification checks RTL matches design intent (does it do what
+   the spec says?). Design validation checks the spec itself is correct for
+   system requirements. Verification happens before/during tape-out; validation
+   happens at the system/silicon level.
+
+Q: What are the four pillars of a modern verification environment?
+A: Stimulus (CRV) — generates legal and illegal transactions to drive the DUT.
+   Monitor — passively observes signals and reconstructs protocol transactions.
+   Scoreboard — maintains golden reference model, compares actual vs expected.
+   Coverage — measures which scenarios were exercised, tells you when to stop.
+
+Q: A simulation runs 1000 transactions with zero failures. Is it verified?
+A: No. Zero failures only means DUT agreed with the reference model for those
+   specific 1000 scenarios. Need coverage closure, correct reference model,
+   corner case testing, reset behavior, and assertion coverage.
+
+Q: What is the difference between code coverage and functional coverage?
+A: Code coverage (line/branch/toggle) is auto-extracted by the simulator —
+   shows which RTL lines executed. Functional coverage is hand-written and
+   shows which meaningful scenarios occurred. 100% code coverage can still
+   miss a critical register read-after-write sequence. Both are needed.
+
+Q: Why must a monitor be passive?
+A: Monitor observes same signals as the driver. If it also drove those signals,
+   you'd have multiple drivers causing bus contention. Also allows reuse across
+   different test environments without affecting DUT behavior.
+
+
+--------------------------------------------------------------------------------
+CATEGORY 2: CRV
+--------------------------------------------------------------------------------
+
+Q: Difference between rand and randc?
+A: rand = independent uniform distribution each call (can repeat).
+   randc = cycles through ALL values in the type before repeating (like a
+   shuffled deck). Use randc for guaranteed full enumeration without duplicates.
+
+Q: What does randomize() return and why does it matter?
+A: Returns bit — 1 if solver satisfied constraints, 0 if failed. If ignored
+   and constraints unsatisfiable, fields stay unchanged and you silently drive
+   stale stimulus. Always check: if (!obj.randomize()) $fatal("failed");
+
+Q: Difference between := and :/ in a dist constraint?
+A: := assigns weight per individual item.
+   :/ distributes total weight across all items in the range.
+   x dist {[0:3] := 10} -> each of 0,1,2,3 gets weight 10 (total 40)
+   x dist {[0:3] :/ 10} -> weight 10 split across all four (each gets 2.5)
+
+Q: Why have both spi_legal_txn and spi_stress_txn?
+A: spi_legal_txn = happy path, verifies core functionality.
+   spi_stress_txn = stresses edge cases: unsupported addresses (30% traffic),
+   aborts mid-command and mid-data, extra clocks, back-to-back frames.
+   Run legal first to confirm baseline, then stress to find corner-case bugs.
+
+Q: How do you temporarily disable a constraint?
+A: obj.constraint_name.constraint_mode(0) to disable, 1 to re-enable.
+   obj.field.rand_mode(0) freezes a specific field's randomization.
+
+Q: Write a constraint for 0x00, 0xFF, or range [0x10:0x1F] with equal
+   group probability.
+A: constraint c {
+       data dist {
+           8'h00        := 1,
+           8'hFF        := 1,
+           [8'h10:8'h1F] :/ 1
+       };
+   }
+
+
+--------------------------------------------------------------------------------
+CATEGORY 3: MONITOR
+--------------------------------------------------------------------------------
+
+Q: How does your SPI monitor detect an aborted frame?
+A: Resets bit_count=0 on negedge cs_n. Increments on every posedge sclk while
+   CS low. On posedge cs_n checks bit_count != 16. Complete SPI frame = 8 cmd
+   bits + 8 data bits = 16 clocks. Any other count = early CS deassert = abort.
+
+Q: What SPI mode does sampling on posedge sclk correspond to?
+A: SPI Mode 0 (CPOL=0, CPHA=0) — clock idles low, data sampled on rising edge.
+   Mode 1 (CPOL=0, CPHA=1): sample negedge sclk.
+   Mode 2 (CPOL=1, CPHA=0): clock idles high, sample negedge sclk.
+   Mode 3 (CPOL=1, CPHA=1): sample posedge sclk, clock idles high.
+
+Q: What is the difference between a monitor and an assertion?
+A: Monitor reconstructs complete protocol-level transactions across multiple
+   clock cycles (accumulates bits to rebuild a frame).
+   Assertion checks a low-level timing property at every clock edge
+   (e.g., "CS must not go high mid-bit").
+   Monitors feed scoreboards and coverage; assertions fire immediately on
+   protocol violations. Both are needed and complement each other.
+
+
+--------------------------------------------------------------------------------
+CATEGORY 4: SCOREBOARD
+--------------------------------------------------------------------------------
+
+Q: Why does your scoreboard need to track state (model_rf array)?
+A: Because a read result depends on all prior writes. If you write 0xAB to
+   address 0x00, then read 0x00, expected value is 0xAB — not a fixed constant.
+   Without tracking state through every write, you can't predict read results.
+   Any DUT with memory requires a stateful reference model.
+
+Q: When would you use $error vs $fatal?
+A: $error for data mismatches you want to count and continue — collect all
+   failures in one run, get full picture, fix together.
+   $fatal for catastrophic conditions where continuing is meaningless: broken
+   reference model, impossible state, testbench assertion failure.
+
+Q: Your scoreboard initializes model_rf[ADC_RESULT_ADDR]=0x55. What if RTL
+   default is 0xAA?
+A: Every read before the first write would be flagged as failure even though
+   DUT is correct. Conversely, if RTL default was changed to 0x55, scoreboard
+   would pass even though silicon behavior changed. Reference model defaults
+   MUST exactly match RTL reset values in the spec.
+
+Q: What is an out-of-order scoreboard and when do you need one?
+A: Standard scoreboard assumes transactions complete in order. Out-of-order
+   handles designs like memory controllers where responses can return in
+   different order than requests were sent. Uses queue or associative array
+   keyed on transaction ID: store expected result when request sent, look up
+   and compare when matching response arrives.
+
+
+--------------------------------------------------------------------------------
+CATEGORY 5: COVERAGE
+--------------------------------------------------------------------------------
+
+Q: What does iff do on a coverpoint?
+A: Sampling guard — coverpoint only updates when condition is true.
+   Example: cp_rw: coverpoint rw_s iff (!aborted_s)
+   Read/write direction only tracked for complete frames. Aborted frame
+   rw value is meaningless, so iff prevents it from polluting coverage data.
+
+Q: What is cross coverage? What does rw_x_addr verify?
+A: Cross coverage = cartesian product of two or more coverpoints, tracks
+   every combination. rw_x_addr crosses cp_rw (read/write) with cp_addr
+   (4 registers + unsupported). Verifies every register was accessed via
+   BOTH read AND write — not just that reads happened and all addresses seen.
+   Without cross: 100% on both individual coverpoints while never having
+   written to ADC_RESULT_ADDR or never having read PGA_CTRL_ADDR.
+
+Q: Explain illegal_bins and ignore_bins.
+A: illegal_bins: marks values that must never occur — hitting them is a
+   simulation error. Use for architecturally forbidden values (reserved
+   encodings, undefined opcodes).
+   ignore_bins: excludes values from coverage calculation — won't count
+   toward 100%, don't affect denominator. Use for technically reachable
+   but meaningless-to-verify values.
+
+Q: Your simulation showed 88.89% coverage. How did you debug it?
+A: 88.89% = 8/9 exactly — one entire coverpoint at 0%, not partially hit.
+   Added cg.coverpoint_name.get_coverage() in the final block for each
+   coverpoint individually. Culprit was cp_wr_then_rd_same: yes bin —
+   requires write followed immediately by read to same address with no
+   other transaction between them. 309 stress aborts kept breaking the
+   sequence. Fix: directed test after random phase forcing that exact sequence.
+
+Q: How do you get coverage percentage programmatically?
+A: cg.get_inst_coverage() — returns 0.0 to 100.0 for that instance.
+   cg.coverpoint_name.get_coverage() — per-coverpoint percentage.
+   $get_coverage() — aggregate across all groups.
+
+
+--------------------------------------------------------------------------------
+CATEGORY 6: DEBUGGING & TOOLS
+--------------------------------------------------------------------------------
+
+Q: You ran 1000 transactions but got 0.00% functional coverage. First 3 checks?
+A: 1. Tool flags — did you compile with -coverage all? Without it, Xcelium
+      silently ignores all covergroup sampling.
+   2. Module instantiation — is the coverage module actually connected in the
+      top-level testbench with the right signals?
+   3. Sampling trigger — add $display inside always @(posedge txn_valid). If
+      it never prints, txn_valid never pulses — monitor frame-end logic isn't
+      firing, meaning driver isn't properly toggling CS.
+
+Q: What does void'() do and when do you need it?
+A: Explicitly casts function return value to void, discarding it.
+   randomize() returns a bit — void'(obj.randomize()) says "I know it returns
+   something and I'm intentionally ignoring it." Production code should use
+   if (!obj.randomize()) $fatal(...) instead for safety.
+
+Q: Why can't you declare a class variable in the middle of an initial block
+   in Xcelium?
+A: Xcelium follows older SV interpretation requiring all variable declarations
+   at the top of a procedural block before any statements. IEEE 1800-2012
+   technically allows mid-block declarations but tool support varies.
+   Fix: declare handles at top (spi_legal_txn wr;), assign later (wr = new();).
+
+
+--------------------------------------------------------------------------------
+CATEGORY 7: ARCHITECTURE & BIG PICTURE
+--------------------------------------------------------------------------------
+
+Q: How would you adapt your SPI verification environment for a RISC-V core?
+A: Same architecture — only transaction and reference model change.
+   spi_txn -> riscv_instr_txn with opcode/rd/rs1/rs2/imm fields.
+   Constraints generate legal instruction encodings.
+   Scoreboard reference model becomes full ISS tracking 32 GPRs and PC.
+   Monitor watches instruction fetch and writeback buses instead of MOSI/MISO.
+   Coverage tracks opcode x funct3, hazard scenarios, branch patterns.
+
+Q: What is UVM and how does it relate to what you built for SPI?
+A: UVM = Universal Verification Methodology. Formalizes same architecture:
+   uvm_driver -> your stimulus driver
+   uvm_monitor -> your spi_monitor.sv
+   uvm_scoreboard -> your spi_scoreboard.sv
+   uvm_sequence_item -> your spi_txn class
+   UVM adds: phasing (build/connect/run/check), factory pattern for overriding
+   components, TLM ports replacing direct signal connections, sequences replacing
+   your run_stress_crv() task.
+
+Q: What would you add to feel confident signing off on tape-out?
+A: 1. Functional coverage at or near 100% on all coverpoints and crosses
+   2. Code coverage (line/branch/toggle) above 90% on RTL
+   3. All SystemVerilog assertions passing including timing properties
+   4. Directed tests for reset behavior, power-on sequencing, glitch scenarios
+   5. Independent review of reference model against design spec
+   6. Regression passing consistently across multiple random seeds
+   Zero failures across all those scenarios is necessary but not sufficient.
+
+
+--------------------------------------------------------------------------------
+QUICK-FIRE ANSWERS (practice under 30 seconds each)
+--------------------------------------------------------------------------------
+
+mailbox      - Thread-safe FIFO for passing objects between processes.
+               put() blocks if full, get() blocks if empty.
+
+semaphore    - Controls mutual exclusion. get() acquires, put() releases.
+
+final begin  - Executes exactly once after $finish. Used for summary reports.
+
+interface    - Groups related signals into named bundle. Simplifies DUT-to-TB
+               connection and enables virtual interfaces.
+
+$display vs  - $display prints once when called.
+$monitor       $monitor triggers automatically whenever its arguments change.
+
+virtual      - Handle to an interface passable to class-based TB components,
+interface      allowing OOP code to drive/sample RTL signals.
+
+disable fork - Kills all child processes spawned by current process. Used to
+               clean up after a timeout or test end.
+
+
+--------------------------------------------------------------------------------
+"TELL ME ABOUT A PROJECT" — USE YOUR SPI WORK
+--------------------------------------------------------------------------------
+
+"Tell me about a verification challenge you faced."
+-> The cp_wr_then_rd_same coverage bin stuck at 0% despite 500 stress
+   transactions. Diagnosed by adding per-coverpoint get_coverage() calls.
+   Fixed with a directed test after the random phase forcing write then
+   read to the same address in sequence.
+
+"Have you used constrained random verification?"
+-> Walk through spi_legal_txn vs spi_stress_txn. Explain dist weights and
+   conditional constraints. Explain why both exist (baseline vs corner cases).
+
+"How did you know when your design was verified enough?"
+-> Explain coverage closure. The 88.89% -> 100% journey. The difference
+   between zero failures and actual coverage percentage.
+
+"Have you debugged a simulation issue?"
+-> The -coverage all flag missing in EDA Playground causing 0.00% despite
+   transactions running. The void'() and mid-block declaration compiler errors.
+   Walked through each fix methodically by reading the error messages.
+
+
+================================================================================
+END OF SESSION
+SPI Interface Verification — 8-bit SAR ADC Project
+================================================================================

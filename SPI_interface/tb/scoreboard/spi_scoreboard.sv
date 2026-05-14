@@ -27,7 +27,7 @@ module spi_scoreboard (
             ADC_RESULT_ADDR,
             STATUS_ADDR,
             PGA_CTRL_ADDR: supported_addr = 1'b1;
-            default: supporyed_addr = 1'b0;
+            default: supported_addr = 1'b0;
         endcase
     endfunction
 
@@ -39,7 +39,7 @@ module spi_scoreboard (
 
         // Match the register defaults
         model_rf[ADC_CFG_ADDR] = 8'h00;
-        model_rf[ADC_RESULT_ADDR] = 8'h00;
+        model_rf[ADC_RESULT_ADDR] = 8'h55;
         model_rf[STATUS_ADDR]= 8'h00;
         model_rf[PGA_CTRL_ADDR] = 8'h00;
 
@@ -83,7 +83,7 @@ module spi_scoreboard (
     end
 
         final begin
-            $display("\n[SB] Summary"):
+            $display("\n[SB] Summary");
             $display("[SB] Writes= %0d", write_count);
             $display("[SB] Reads=%0d", read_count);
             $display("[SB] Aborts=%0d", abort_count);

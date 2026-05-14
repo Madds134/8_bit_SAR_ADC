@@ -4,6 +4,7 @@ module spi_monitor (
     input logic mosi,
     input logic miso,
 
+    output logic txn_valid,
     output logic frame_done,
     output logic aborted,
     output logic rw,
@@ -21,6 +22,7 @@ module spi_monitor (
 
     initial begin
         in_frame = 1'b0;
+        txn_valid = 1'b0;
         frame_done = 1'b0;
         aborted = 1'b0;
         rw = 1'b0;
@@ -36,7 +38,8 @@ module spi_monitor (
 
     // Start of frame
     always @(negedge cs_n) begin
-        in_frame <= 1'b1;
+        in_frame  <= 1'b1;
+        txn_valid <= 1'b0;
         frame_done <= 1'b0;
         aborted <= 1'b0;
         rw <= 1'b0;
@@ -85,6 +88,7 @@ module spi_monitor (
     always @(posedge cs_n) begin
         if (in_frame) begin
             frame_done <= 1'b1;
+            txn_valid <= 1'b1;
             aborted <= (bit_count != 5'd16);
             in_frame <= 1'b0;
 

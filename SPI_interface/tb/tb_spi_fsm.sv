@@ -1,3 +1,4 @@
+// DEPRECATED
 `timescale 1ns/1ps
 
 module tb_spi_fsm;
@@ -13,6 +14,9 @@ module tb_spi_fsm;
   	logic [4:0] bit_count;
   	logic [7:0] rx_data;
   	logic cmd_valid;
+    logic [7:0] pga_ctrl;
+    logic [7:0] adc_cfg;
+  	logic [6:0] rf_addr;
   	
   	// Instantiate the rx_shift_register
     rx_shift_register r_reg(
@@ -38,8 +42,11 @@ module tb_spi_fsm;
       	.rx_data(rx_data),
       	.bit_count(bit_count),
         .addr(addr),
+      	.cmd_valid(cmd_valid),
         .reg_write_en(reg_write_en),
-      	.tx_load_en(tx_load_en)
+      	.tx_load_en(tx_load_en),
+      	.rf_addr(rf_addr)
+      
     );
   
   	tx_shift_register sr (
@@ -50,6 +57,17 @@ module tb_spi_fsm;
         .tx_load_en(tx_load_en),
         .miso(miso)
     );
+
+    register_file rf (
+        .sclk(sclk),
+        .cs_n(cs_n),
+        .reg_write_en(reg_write_en),
+        .w_data(rx_data),
+      	.addr(rf_addr),
+        .r_data(w_data),
+        .pga_ctrl(pga_ctrl),
+        .adc_cfg(adc_cfg)
+    );
   	
 
     always #20 sclk = ~sclk;
@@ -58,12 +76,13 @@ module tb_spi_fsm;
         $dumpfile("spi_fsm.vcd");
         $dumpvars(0, dut);
       	$dumpvars(0, sr);
+      	$dumpvars(0, rf);
 
         sclk = 0;
         cs_n = 1;
         mosi = 0;
-        pattern = 16'hFFFF;
-      	w_data = 8'h55;
+        pattern = 16'h81FF;
+//       	w_data = 8'h55;
 
         #10;
         @(negedge sclk);
@@ -76,7 +95,7 @@ module tb_spi_fsm;
         end
 
         @(negedge sclk);
-      	#40;
+      	#80;
         cs_n = 1;
         mosi = 0;
 
